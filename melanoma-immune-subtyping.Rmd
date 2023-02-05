@@ -99,7 +99,7 @@ data <- list(
 
 lapply(data, dim)
 
-saveRDS(data,'output/data.RDS')
+saveRDS(data, 'output/data.RDS')
 ```
 
 ```{r, include = FALSE, echo = FALSE}
@@ -219,4 +219,153 @@ saveRDS(data, 'output/dataNoOutlier.RDS')
 
 ```{r, include = FALSE, echo = FALSE}
 rm(cv, cvCutoff, limit, distances, hClusters, colors, pca, pcaPlots, i, j, xlabel, ylabel, counter, data)
+```
+
+## Determine phenotype {.tabset .tabset-pills}
+
+- Perform unsupervised k-means and hierarchical clustering, as well as clustering using scientific methods (using
+  already published algorithm by Mlynska et al.). For all clustering methods, only a subset of genes were used. These
+  are the genes of the scientific clustering algorithm.
+  - **TODO: does it make sense to remove these genes from further analysis?**
+- In order to select samples with the clearest phenotypic features, we chose clusters obtained from k-means and
+  the scientific method as they had the best overlap (N = 354 samples vs N = 339 samples in case of hierarchical
+  and scientific method overlap). Using the overlap of all three methods would have resulted in a too greatly
+  reduced dataset.
+- Final dataset contains 354 samples and 1372 genes.
+
+```{r}
+source('R/determinePhenotype.R')
+
+data <- readRDS('output/dataNoOutlier.RDS')
+
+set.seed(420)
+x <- data$x[ , data$classificationGenes[ , Gene ] ]
+
+kmeansClust <- kmeans(x, 3)$cluster
+hierClust <- x %>%
+  dist(method = 'euclidean') %>%
+  hclust %>%
+  cutree(k = 3)
+scientClust <- determinePhenotype(x, data$classificationGenes)
+
+phenotypes <- scientClust %>%
+  merge(data.table(SID = names(kmeansClust), kMeans = make.names(kmeansClust))) %>%
+  merge(data.table(SID = names(hierClust), Hierarchical = make.names(hierClust)))
+
+phenotypes[ , table(Phenotype, kMeans) ]
+phenotypes[ , table(Hierarchical, kMeans) ]
+phenotypes[ , table(Phenotype, Hierarchical) ]
+```
+
+### Scientific clustering
+
+```{r}
+annoRow <- data$classificationGenes[ , list(Type) ] %>%
+  as.data.frame
+rownames(annoRow) <- data$classificationGenes[ , Gene ]
+
+annoCol <- phenotypes[ , list(Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- phenotypes[ , SID ]
+
+pheatmap(t(x)[ data$classificationGenes[ order(Type), Gene ], phenotypes[ order(Phenotype), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -3.5, to = 3.5, length.out = 101),
+         annotation_col = annoCol,
+         annotation_row = annoRow)
+```
+
+### Hierarchical clustering
+
+```{r}
+annoRow <- data$classificationGenes[ , list(Type) ] %>%
+  as.data.frame
+rownames(annoRow) <- data$classificationGenes[ , Gene ]
+
+annoCol <- phenotypes[ , list(Hierarchical, Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- phenotypes[ , SID ]
+
+pheatmap(t(x)[ data$classificationGenes[ order(Type), Gene ], phenotypes[ order(Hierarchical), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -3.5, to = 3.5, length.out = 101),
+         annotation_col = annoCol,
+         annotation_row = annoRow)
+```
+
+### K-means clustering
+
+```{r}
+annoRow <- data$classificationGenes[ , list(Type) ] %>%
+  as.data.frame
+rownames(annoRow) <- data$classificationGenes[ , Gene ]
+
+annoCol <- phenotypes[ , list(kMeans, Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- phenotypes[ , SID ]
+
+pheatmap(t(x)[ data$classificationGenes[ order(Type), Gene ], phenotypes[ order(kMeans), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -3.5, to = 3.5, length.out = 101),
+         annotation_col = annoCol,
+         annotation_row = annoRow)
+```
+
+### Final clusters
+
+```{r}
+# Set final phenotype based on k-means clustering and the results of the scientific clustering method
+# and select only samples with assigned phenotype for further analysis
+key <- phenotypes %>%
+  .[ kMeans == 'X1' & Phenotype == 'Inf', FinalPheno := 'Inf' ] %>%
+  .[ kMeans == 'X2' & Phenotype == 'Exc', FinalPheno := 'Exc' ] %>%
+  .[ kMeans == 'X3' & Phenotype == 'Des', FinalPheno := 'Des' ] %>%
+  .[ !is.na(FinalPheno) ] %>%
+  .[ , list(SID, Phenotype = FinalPheno) ] %>%
+  .[ , Phenotype := factor(Phenotype, levels = c('Des', 'Exc', 'Inf')) ] %>%
+  merge(data$key, by = 'SID')
+
+x <- data$x[ key[ , SID ], ]
+
+data <- list(
+  x = x,
+  key = key,
+  map = data$map,
+  classificationGenes = data$classificationGenes
+)
+
+lapply(data, dim)
+saveRDS(data, 'output/dataWithPhenotype.RDS')
+```
+
+```{r}
+annoRow <- data$classificationGenes[ , list(Type) ] %>%
+  as.data.frame
+rownames(annoRow) <- data$classificationGenes[ , Gene ]
+
+annoCol <- data$key[ , list(Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- data$key[ , SID ]
+
+pheatmap(t(x)[ data$classificationGenes[ order(Type), Gene ], data$key[ order(Phenotype), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -3.5, to = 3.5, length.out = 101),
+         annotation_col = annoCol,
+         annotation_row = annoRow)
+```
+
+```{r, include = FALSE, echo = FALSE}
+rm(kmeansClust, hierClust, scientClust, scientClust, annoRow, annoCol, x, data, key)
 ```
