@@ -2,22 +2,19 @@
 title: Melanoma immune subtyping
 date: 2023-02-05
 author: Ieva Kerševičiūtė
-output:
-  html_document:
-    self_contained: true
-    toc: true
-    toc_depth: 3
-    toc_float:
-      collapsed: false
-      smooth_scroll: true
 ---
 
 ```{r, include = FALSE, echo = FALSE}
 library(data.table)
 library(tidyverse)
+library(pheatmap)
+library(WGCNA)
+library(ggpubr)
 ```
 
-# Download the data
+# {.tabset .tabset-pills .unlisted .unnumbered}
+
+## Download the data
 
 The final gene list was formed from:
 
@@ -36,8 +33,10 @@ if (!file.exists('output/raw.RDS')) {
 }
 ```
 
-# Prepare the clinical information
+## Prepare the clinical information
 
+- [Clinical data](http://www.cbioportal.org/study/clinicalData?id=skcm_tcga) was downloaded directly from
+  [cBioPortal](www.cbioportal.org) on 7th January, 2022.
 - Select a subset of available columns and format them
 - Drop data of the samples for which we do not have the clinical information (N = 2)
 - Drop non-unique clinical information (N = 9). Note that these samples only had clinical information duplicated
@@ -101,4 +100,123 @@ data <- list(
 lapply(data, dim)
 
 saveRDS(data,'output/data.RDS')
+```
+
+```{r, include = FALSE, echo = FALSE}
+rm(raw, key, classificationGenes)
+```
+
+## Outlier detection
+
+- 199 genes had CV smaller than cutoff = 5; they were removed from further analysis
+- No clear outliers detected in hierarchical clustering
+- No clear outliers in PCA plots
+- After outlier detection, continuing analysis with 1372 genes from 469 samples
+
+### Coefficient of variation (CV)
+
+First step in data preparation is detecting any genes that have small variability among all samples and removing
+them. Coefficient of variation shows the extent of variability of data in a sample in relation to the mean of the
+population^[1](https://www.investopedia.com/terms/c/coefficientofvariation.asp)^. The smaller the CV, the less dispersed
+the data points. In our case, we are looking for high variability between immune groups and small variability within
+the group, so we can safely remove any genes that have small overall dispersion in all samples since they do not
+separate the samples well and thus will not be detected as significant biomarkers.
+
+$$
+c_v = \frac{\sigma}{\mu}
+$$
+
+```{r}
+data <- readRDS('output/data.RDS')
+
+cvCutoff <- 5
+cv <- apply(data$x, 2, \(x) { sd(x) / abs(mean(x)) })
+
+sum(cv < cvCutoff)
+
+data.table(CV = cv) %>%
+  .[ CV < 100 ] %>%
+  .[ , WillDrop := ifelse(CV < cvCutoff, 'Yes', 'No') %>% factor(levels = c('Yes', 'No')) ] %>%
+  ggplot() +
+  geom_histogram(aes(x = CV, fill = WillDrop), binwidth = 2, color = 'black') +
+  scale_fill_manual(name = 'Will be dropped', values = c('Yes' = 'salmon', 'No' = 'white')) +
+  theme_bw(base_size = 9) +
+  xlab('Coefficient of variation') +
+  ylab('Count')
+
+limit <- max(abs(data$x))
+
+message('Heatmap of gene expression of the genes with small CV')
+pheatmap(
+  t(data$x[ , which(cv < cvCutoff) ]),
+  breaks = seq(from = -limit, to = limit, length.out = 101),
+  show_colnames = FALSE,
+  show_rownames = FALSE)
+
+data$x <- data$x[ , which(cv >= cvCutoff) ]
+data$map <- data$map[ Symbol %in% colnames(data$x) ]
+data$classificationGenes <- data$classificationGenes[ Gene %in% colnames(data$x) ]
+```
+
+### Hierarchical clustering
+
+Hierarchical clustering can be used to visually detect any outliers in the data. Using euclidean method to calculate
+the distances between samples.
+
+The dendrogram does not show any clear outliers (they would be seen as separated branches).
+
+```{r}
+distances <- dist(data$x, method = 'euclidean')
+hClusters <- hclust(distances)
+
+colors <- data$key[ , list(
+  Sex = labels2colors(Sex),
+  SurvivalStatus = labels2colors(SurvivalStatus)
+) ]
+
+plotDendroAndColors(hClusters, colors, dendroLabels = FALSE)
+```
+
+### Principal Component Analysis
+
+PCA was used to check if there is any global trends towards the differences between sexes. No such trends are visible
+from the first 3 components. Also, these components do not show any outliers.
+
+```{r}
+pca <- prcomp(data$x, scale = TRUE, center = TRUE)$x[ , 1:3 ]
+
+pcaPlots <- list()
+counter <- 1
+for (i in 1:(ncol(pca) - 1)) {
+  for (j in i:ncol(pca)) {
+    if (i == j) next
+
+    xlabel <- colnames(pca)[ i ]
+    ylabel <- colnames(pca)[ j ]
+
+    pcaPlots[[ counter ]] <- pca[ , c(i, j) ] %>%
+      data.table(keep.rownames = 'SID') %>%
+      setnames(c('SID', 'x', 'y')) %>%
+      merge(data$key[ , list(SID, Sex) ], by = 'SID') %>%
+      ggplot() +
+      geom_point(aes(x = x, y = y, color = Sex), size = 1.5, alpha = 0.75) +
+      ylab(ylabel) +
+      xlab(xlabel) +
+      theme_bw(base_size = 9)
+
+    counter <- counter + 1
+  }
+}
+
+ggarrange(plotlist = pcaPlots,
+          common.legend = TRUE,
+          legend = 'top',
+          ncol = 3)
+
+lapply(data, dim)
+saveRDS(data, 'output/dataNoOutlier.RDS')
+```
+
+```{r, include = FALSE, echo = FALSE}
+rm(cv, cvCutoff, limit, distances, hClusters, colors, pca, pcaPlots, i, j, xlabel, ylabel, counter, data)
 ```
