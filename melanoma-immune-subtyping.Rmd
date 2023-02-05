@@ -12,6 +12,8 @@ library(WGCNA)
 library(ggpubr)
 library(limma)
 library(foreach)
+library(survminer)
+library(survival)
 ```
 
 # {.tabset .tabset-pills .unlisted .unnumbered}
@@ -221,6 +223,25 @@ saveRDS(data, 'output/dataNoOutlier.RDS')
 
 ```{r, include = FALSE, echo = FALSE}
 rm(cv, cvCutoff, limit, distances, hClusters, colors, pca, pcaPlots, i, j, xlabel, ylabel, counter, data)
+```
+
+## Survival analysis
+
+```{r}
+data <- readRDS('output/dataWithPhenotype.RDS')
+
+survival <- Surv(time = data$key[ , SurvivalMonths], event = as.numeric(data$key[ , SurvivalStatus]))
+fit <- survfit(survival ~ Phenotype, data = data$key)
+# summary(fit)
+
+ggsurvplot(fit, data = data$key, pval = TRUE)
+
+fit.coxph <- coxph(survival ~ Phenotype, data = data$key)
+ggforest(fit.coxph, data = data$key)
+```
+
+```{r, include = FALSE, echo = FALSE}
+rm(survival, fit, fit.coxph)
 ```
 
 ## Determine phenotype {.tabset .tabset-pills}
