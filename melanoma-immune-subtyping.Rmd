@@ -10,6 +10,8 @@ library(tidyverse)
 library(pheatmap)
 library(WGCNA)
 library(ggpubr)
+library(limma)
+library(foreach)
 ```
 
 # {.tabset .tabset-pills .unlisted .unnumbered}
@@ -36,7 +38,7 @@ if (!file.exists('output/raw.RDS')) {
 ## Prepare the clinical information
 
 - [Clinical data](http://www.cbioportal.org/study/clinicalData?id=skcm_tcga) was downloaded directly from
-  [cBioPortal](www.cbioportal.org) on 7th January, 2022.
+  [cBioPortal](https://www.cbioportal.org) on 7th January 2022.
 - Select a subset of available columns and format them
 - Drop data of the samples for which we do not have the clinical information (N = 2)
 - Drop non-unique clinical information (N = 9). Note that these samples only had clinical information duplicated
@@ -106,7 +108,7 @@ saveRDS(data, 'output/data.RDS')
 rm(raw, key, classificationGenes)
 ```
 
-## Outlier detection
+## Detect outliers
 
 - 199 genes had CV smaller than cutoff = 5; they were removed from further analysis
 - No clear outliers detected in hierarchical clustering
@@ -368,4 +370,207 @@ pheatmap(t(x)[ data$classificationGenes[ order(Type), Gene ], data$key[ order(Ph
 
 ```{r, include = FALSE, echo = FALSE}
 rm(kmeansClust, hierClust, scientClust, scientClust, annoRow, annoCol, x, data, key)
+```
+
+## Select biomarker genes {.tabset .tabset-pills}
+
+- Fitting linear model to determine which genes are most differentially abundant between different groups.
+- Model adjusted for Phenotype, Age and Sex.
+
+```{r}
+data <- readRDS('output/dataWithPhenotype.RDS')
+
+formula <- '~ 0 + Phenotype + Sex + Age' %>% as.formula
+data$key[ is.na(Age), Age := data$key[ , median(Age, na.rm = TRUE) ] ]
+design <- model.matrix(formula, data$key)
+
+contrasts <- list(
+  Excluded = 'PhenotypeExc - (PhenotypeInf + PhenotypeDes) / 2',
+  Inflamed = 'PhenotypeInf - (PhenotypeExc + PhenotypeDes) / 2',
+  Deserted = 'PhenotypeDes - (PhenotypeInf + PhenotypeExc) / 2'
+)
+
+cm <- makeContrasts(contrasts = contrasts, levels = design)
+colnames(cm) <- names(contrasts)
+
+fit <- lmFit(t(data$x), design, method = 'ls')
+fitc <- contrasts.fit(fit, cm)
+fitc <- eBayes(fitc)
+
+limma <- foreach(contrast = names(contrasts), .combine = rbind) %do% {
+  dt <- topTable(fitc, coef = contrast, number = Inf, sort.by = 'none')
+  if ('ID' %in% colnames(dt)) {
+    return(data.table(dt, Contrast = contrast))
+  } else {
+    return(data.table(ID = rownames(dt), as.data.frame(dt), Contrast = contrast))
+  }
+}
+
+saveRDS(limma, 'output/limma.RDS')
+```
+
+```{r, include = FALSE, echo = FALSE}
+rm(formula, design, contrasts, cm, fit, fitc)
+```
+
+### Excluded
+
+```{r}
+contrast <- 'Excluded'
+```
+
+```{r}
+p1 <- limma[ Contrast == contrast ] %>%
+  ggplot() +
+  geom_histogram(aes(P.Value), binwidth = 0.025, fill = 'white', color = 'black') +
+  theme_bw(base_size = 9)
+
+p2 <- limma[ Contrast == contrast ] %>%
+  .[ , Significant := 'No' ] %>%
+  .[ adj.P.Val < 0.05 & logFC > 1, Significant := 'Yes (up-reg)' ] %>%
+  .[ adj.P.Val < 0.05 & logFC < -1, Significant := 'Yes (down-reg)' ] %>%
+  ggplot() +
+  geom_point(aes(x = logFC, y = -log10(P.Value), color = Significant)) +
+  scale_color_manual(values = c('Yes (up-reg)' = 'salmon', 'Yes (down-reg)' = 'cyan3', 'No' = 'gray80')) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = 'top')
+
+ggarrange(p1, p2, nrow = 1)
+
+ids <- limma[ Contrast == contrast ] %>%
+  .[ order(P.Value) ] %>%
+  .[ 1:6, ID ]
+
+data$x[ , ids ] %>%
+  as.matrix %>%
+  reshape2::melt() %>%
+  setDT %>%
+  setnames(c('SID', 'Gene', 'z-score')) %>%
+  merge(data$key[ , list(SID, Phenotype) ], by = 'SID') %>%
+  ggplot() +
+  facet_wrap(~ Gene, ) +
+  geom_violin(aes(x = Phenotype, y = `z-score`, fill = Phenotype, color = Phenotype), alpha = 0.25) +
+  geom_jitter(aes(x = Phenotype, y = `z-score`, color = Phenotype), height = 0, width = 0.25, size = 0.5, alpha = 0.75)
+```
+
+```{r}
+annoCol <- data$key[ , list(Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- data$key[ , SID ]
+
+pheatmap(t(data$x)[ ids, data$key[ order(Phenotype), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -2.5, to = 2.5, length.out = 101),
+         annotation_col = annoCol)
+```
+
+### Deserted
+
+```{r}
+contrast <- 'Deserted'
+```
+
+```{r}
+p1 <- limma[ Contrast == contrast ] %>%
+  ggplot() +
+  geom_histogram(aes(P.Value), binwidth = 0.025, fill = 'white', color = 'black') +
+  theme_bw(base_size = 9)
+
+p2 <- limma[ Contrast == contrast ] %>%
+  .[ , Significant := 'No' ] %>%
+  .[ adj.P.Val < 0.05 & logFC > 1, Significant := 'Yes (up-reg)' ] %>%
+  .[ adj.P.Val < 0.05 & logFC < -1, Significant := 'Yes (down-reg)' ] %>%
+  ggplot() +
+  geom_point(aes(x = logFC, y = -log10(P.Value), color = Significant)) +
+  scale_color_manual(values = c('Yes (up-reg)' = 'salmon', 'Yes (down-reg)' = 'cyan3', 'No' = 'gray80')) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = 'top')
+
+ggarrange(p1, p2, nrow = 1)
+
+ids <- limma[ Contrast == contrast ] %>%
+  .[ order(P.Value) ] %>%
+  .[ 1:6, ID ]
+
+data$x[ , ids ] %>%
+  as.matrix %>%
+  reshape2::melt() %>%
+  setDT %>%
+  setnames(c('SID', 'Gene', 'z-score')) %>%
+  merge(data$key[ , list(SID, Phenotype) ], by = 'SID') %>%
+  ggplot() +
+  facet_wrap(~ Gene, ) +
+  geom_violin(aes(x = Phenotype, y = `z-score`, fill = Phenotype, color = Phenotype), alpha = 0.25) +
+  geom_jitter(aes(x = Phenotype, y = `z-score`, color = Phenotype), height = 0, width = 0.25, size = 0.5, alpha = 0.75)
+```
+
+```{r}
+annoCol <- data$key[ , list(Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- data$key[ , SID ]
+
+pheatmap(t(data$x)[ ids, data$key[ order(Phenotype), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -2.5, to = 2.5, length.out = 101),
+         annotation_col = annoCol)
+```
+
+### Inflamed
+
+```{r}
+contrast <- 'Inflamed'
+```
+
+```{r}
+p1 <- limma[ Contrast == contrast ] %>%
+  ggplot() +
+  geom_histogram(aes(P.Value), binwidth = 0.025, fill = 'white', color = 'black') +
+  theme_bw(base_size = 9)
+
+p2 <- limma[ Contrast == contrast ] %>%
+  .[ , Significant := 'No' ] %>%
+  .[ adj.P.Val < 0.05 & logFC > 1, Significant := 'Yes (up-reg)' ] %>%
+  .[ adj.P.Val < 0.05 & logFC < -1, Significant := 'Yes (down-reg)' ] %>%
+  ggplot() +
+  geom_point(aes(x = logFC, y = -log10(P.Value), color = Significant)) +
+  scale_color_manual(values = c('Yes (up-reg)' = 'salmon', 'Yes (down-reg)' = 'cyan3', 'No' = 'gray80')) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = 'top')
+
+ggarrange(p1, p2, nrow = 1)
+
+ids <- limma[ Contrast == contrast ] %>%
+  .[ order(P.Value) ] %>%
+  .[ 1:6, ID ]
+
+data$x[ , ids ] %>%
+  as.matrix %>%
+  reshape2::melt() %>%
+  setDT %>%
+  setnames(c('SID', 'Gene', 'z-score')) %>%
+  merge(data$key[ , list(SID, Phenotype) ], by = 'SID') %>%
+  ggplot() +
+  facet_wrap(~ Gene, ) +
+  geom_violin(aes(x = Phenotype, y = `z-score`, fill = Phenotype, color = Phenotype), alpha = 0.25) +
+  geom_jitter(aes(x = Phenotype, y = `z-score`, color = Phenotype), height = 0, width = 0.25, size = 0.5, alpha = 0.75)
+```
+
+```{r}
+annoCol <- data$key[ , list(Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- data$key[ , SID ]
+
+pheatmap(t(data$x)[ ids, data$key[ order(Phenotype), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -2.5, to = 2.5, length.out = 101),
+         annotation_col = annoCol)
 ```
