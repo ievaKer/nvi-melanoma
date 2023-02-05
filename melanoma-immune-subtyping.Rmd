@@ -1,0 +1,31 @@
+---
+title: Melanoma immune subtyping
+date: 2023-02-05
+author: Ieva Kerševičiūtė
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+# Download the data
+
+The final gene list was formed from:
+
+- classificationGenes.csv
+- LBL-10025-02_PanCancer-Pathways-Gene-List.xlsx
+- LBL-10043-08_nCounter_PanCancer_Immune_Profiling_Panel_Gene_List.xlsx
+- LBL-10498-02_IO_360_Gene_List.xlsx
+
+```{r}
+if (!file.exists('output/raw.RDS')) {
+  message('Downloading TCGA melanoma z-scores')
+  source('R/download.R', chdir = TRUE)
+} else {
+  message('TCGA melanoma z-scores already downloaded')
+}
+```
