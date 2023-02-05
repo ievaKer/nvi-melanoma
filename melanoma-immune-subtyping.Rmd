@@ -12,6 +12,11 @@ output:
       smooth_scroll: true
 ---
 
+```{r, include = FALSE, echo = FALSE}
+library(data.table)
+library(tidyverse)
+```
+
 # Download the data
 
 The final gene list was formed from:
@@ -25,7 +30,75 @@ The final gene list was formed from:
 if (!file.exists('output/raw.RDS')) {
   message('Downloading TCGA melanoma z-scores')
   source('R/download.R', chdir = TRUE)
+  downloadTCGA()
 } else {
   message('TCGA melanoma z-scores already downloaded')
 }
+```
+
+# Prepare the clinical information
+
+- Select a subset of available columns and format them
+- Drop data of the samples for which we do not have the clinical information (N = 2)
+- Drop non-unique clinical information (N = 9). Note that these samples only had clinical information duplicated
+  and a single entry in the count matrix
+- From the gene map, drop genes which could not be downloaded (N = 3)
+- Make sure all classification genes are in the count matrix
+
+```{r}
+raw <- readRDS('output/raw.RDS')
+
+cols <- c('Patient ID', 'Diagnosis Age', 'Overall Survival (Months)', 'Overall Survival Status', 'Sex', 'Patient Weight', 'Patient Height')
+
+key <- fread('data/skcm_tcga_clinical_data.tsv') %>%
+  .[ , ..cols ] %>%
+  setnames(c('SID', 'Age', 'SurvivalMonths', 'SurvivalStatus', 'Sex', 'Weight', 'Height')) %>%
+  .[ , Age := as.numeric(Age) ] %>%
+  .[ , SurvivalMonths := as.numeric(SurvivalMonths) ] %>%
+  .[ , SurvivalStatus := ifelse(SurvivalStatus == '1:DECEASED', 'Deceased', 'Living') ] %>%
+  .[ , SurvivalStatus := factor(SurvivalStatus, levels = c('Living', 'Deceased')) ] %>%
+  .[ , Sex := factor(Sex, levels = c('Male', 'Female')) ] %>%
+  .[ , Weight := as.numeric(Weight) ] %>%
+  .[ , Height := as.numeric(Height) ] %>%
+  .[ , BMI := Weight / (Height / 100 * Height / 100) ]
+
+# Drop count data which is not in the sample sheet
+message('Will drop ', sum(!(key[ , SID ] %in% rownames(raw$x))), ' clinical entries without count data.') # 2
+key <- key[ SID %in% rownames(raw$x) ]
+
+# First, let's keep only unique key
+duplicatedSIDs <- key[ duplicated(SID), SID ]
+key[ SID %in% duplicatedSIDs ]
+stopifnot(raw$x[ duplicatedSIDs, ] %>% nrow == length(duplicatedSIDs)) # make sure only clinical info is duplicated
+message('Will drop ', length(duplicatedSIDs), ' non-unique clinical entries.') # 9
+
+key <- key[ !duplicated(SID) ]
+
+# Keep counts of samples with clinical information
+raw$x <- raw$x[ match(key[ , SID ], rownames(raw$x)) %>% na.omit, ]
+key <- key[ SID %in% rownames(raw$x) ]
+
+stopifnot(nrow(raw$x) == nrow(key))
+
+# Check if all genes in the count matrix
+raw$x <- raw$x[ , match(raw$map[ , Symbol ], colnames(raw$x)) %>% na.omit ]
+raw$map <- raw$map[ match(colnames(raw$x), Symbol) ]
+
+# Apparently, we did not find data for 3 genes
+stopifnot(all(raw$map[ , Symbol ] %in% colnames(raw$x)))
+
+# Check if all classification genes are in the count matrix
+classificationGenes <- fread('data/classificationGenes.csv') %>%
+  .[ Gene %in% colnames(raw$x) ]
+
+data <- list(
+  x = raw$x,
+  key = key,
+  map = raw$map,
+  classificationGenes = classificationGenes
+)
+
+lapply(data, dim)
+
+saveRDS(data,'output/data.RDS')
 ```
