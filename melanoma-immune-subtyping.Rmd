@@ -1,0 +1,597 @@
+---
+title: Melanoma immune subtyping
+date: 2023-02-05
+author: Ieva Kerševičiūtė
+---
+
+```{r, include = FALSE, echo = FALSE}
+library(data.table)
+library(tidyverse)
+library(pheatmap)
+library(WGCNA)
+library(ggpubr)
+library(limma)
+library(foreach)
+library(survminer)
+library(survival)
+```
+
+# {.tabset .tabset-pills .unlisted .unnumbered}
+
+## Download the data
+
+The final gene list was formed from:
+
+- classificationGenes.csv
+- LBL-10025-02_PanCancer-Pathways-Gene-List.xlsx
+- LBL-10043-08_nCounter_PanCancer_Immune_Profiling_Panel_Gene_List.xlsx
+- LBL-10498-02_IO_360_Gene_List.xlsx
+
+```{r}
+if (!file.exists('output/raw.RDS')) {
+  message('Downloading TCGA melanoma z-scores')
+  source('R/download.R', chdir = TRUE)
+  downloadTCGA()
+} else {
+  message('TCGA melanoma z-scores already downloaded')
+}
+```
+
+## Prepare the clinical information
+
+- [Clinical data](http://www.cbioportal.org/study/clinicalData?id=skcm_tcga) was downloaded directly from
+  [cBioPortal](https://www.cbioportal.org) on 7th January 2022.
+- Select a subset of available columns and format them
+- Drop data of the samples for which we do not have the clinical information (N = 2)
+- Drop non-unique clinical information (N = 9). Note that these samples only had clinical information duplicated
+  and a single entry in the count matrix
+- From the gene map, drop genes which could not be downloaded (N = 3)
+- Make sure all classification genes are in the count matrix
+
+```{r}
+raw <- readRDS('output/raw.RDS')
+
+cols <- c('Patient ID', 'Diagnosis Age', 'Overall Survival (Months)', 'Overall Survival Status', 'Sex', 'Patient Weight', 'Patient Height')
+
+key <- fread('data/skcm_tcga_clinical_data.tsv') %>%
+  .[ , ..cols ] %>%
+  setnames(c('SID', 'Age', 'SurvivalMonths', 'SurvivalStatus', 'Sex', 'Weight', 'Height')) %>%
+  .[ , Age := as.numeric(Age) ] %>%
+  .[ , SurvivalMonths := as.numeric(SurvivalMonths) ] %>%
+  .[ , SurvivalStatus := ifelse(SurvivalStatus == '1:DECEASED', 'Deceased', 'Living') ] %>%
+  .[ , SurvivalStatus := factor(SurvivalStatus, levels = c('Living', 'Deceased')) ] %>%
+  .[ , Sex := factor(Sex, levels = c('Male', 'Female')) ] %>%
+  .[ , Weight := as.numeric(Weight) ] %>%
+  .[ , Height := as.numeric(Height) ] %>%
+  .[ , BMI := Weight / (Height / 100 * Height / 100) ]
+
+# Drop count data which is not in the sample sheet
+message('Will drop ', sum(!(key[ , SID ] %in% rownames(raw$x))), ' clinical entries without count data.') # 2
+key <- key[ SID %in% rownames(raw$x) ]
+
+# First, let's keep only unique key
+duplicatedSIDs <- key[ duplicated(SID), SID ]
+key[ SID %in% duplicatedSIDs ]
+stopifnot(raw$x[ duplicatedSIDs, ] %>% nrow == length(duplicatedSIDs)) # make sure only clinical info is duplicated
+message('Will drop ', length(duplicatedSIDs), ' non-unique clinical entries.') # 9
+
+key <- key[ !duplicated(SID) ]
+
+# Keep counts of samples with clinical information
+raw$x <- raw$x[ match(key[ , SID ], rownames(raw$x)) %>% na.omit, ]
+key <- key[ SID %in% rownames(raw$x) ]
+
+stopifnot(nrow(raw$x) == nrow(key))
+
+# Check if all genes in the count matrix
+raw$x <- raw$x[ , match(raw$map[ , Symbol ], colnames(raw$x)) %>% na.omit ]
+raw$map <- raw$map[ match(colnames(raw$x), Symbol) ]
+
+# Apparently, we did not find data for 3 genes
+stopifnot(all(raw$map[ , Symbol ] %in% colnames(raw$x)))
+
+# Check if all classification genes are in the count matrix
+classificationGenes <- fread('data/classificationGenes.csv') %>%
+  .[ Gene %in% colnames(raw$x) ]
+
+data <- list(
+  x = raw$x,
+  key = key,
+  map = raw$map,
+  classificationGenes = classificationGenes
+)
+
+lapply(data, dim)
+
+saveRDS(data, 'output/data.RDS')
+```
+
+```{r, include = FALSE, echo = FALSE}
+rm(raw, key, classificationGenes)
+```
+
+## Detect outliers
+
+- 199 genes had CV smaller than cutoff = 5; they were removed from further analysis
+- No clear outliers detected in hierarchical clustering
+- No clear outliers in PCA plots
+- After outlier detection, continuing analysis with 1372 genes from 469 samples
+
+### Coefficient of variation (CV)
+
+First step in data preparation is detecting any genes that have small variability among all samples and removing
+them. Coefficient of variation shows the extent of variability of data in a sample in relation to the mean of the
+population^[1](https://www.investopedia.com/terms/c/coefficientofvariation.asp)^. The smaller the CV, the less dispersed
+the data points. In our case, we are looking for high variability between immune groups and small variability within
+the group, so we can safely remove any genes that have small overall dispersion in all samples since they do not
+separate the samples well and thus will not be detected as significant biomarkers.
+
+$$
+c_v = \frac{\sigma}{\mu}
+$$
+
+```{r}
+data <- readRDS('output/data.RDS')
+
+cvCutoff <- 5
+cv <- apply(data$x, 2, \(x) { sd(x) / abs(mean(x)) })
+
+sum(cv < cvCutoff)
+
+data.table(CV = cv) %>%
+  .[ CV < 100 ] %>%
+  .[ , WillDrop := ifelse(CV < cvCutoff, 'Yes', 'No') %>% factor(levels = c('Yes', 'No')) ] %>%
+  ggplot() +
+  geom_histogram(aes(x = CV, fill = WillDrop), binwidth = 2, color = 'black') +
+  scale_fill_manual(name = 'Will be dropped', values = c('Yes' = 'salmon', 'No' = 'white')) +
+  theme_bw(base_size = 9) +
+  xlab('Coefficient of variation') +
+  ylab('Count')
+
+limit <- max(abs(data$x))
+
+message('Heatmap of gene expression of the genes with small CV')
+pheatmap(
+  t(data$x[ , which(cv < cvCutoff) ]),
+  breaks = seq(from = -limit, to = limit, length.out = 101),
+  show_colnames = FALSE,
+  show_rownames = FALSE)
+
+data$x <- data$x[ , which(cv >= cvCutoff) ]
+data$map <- data$map[ Symbol %in% colnames(data$x) ]
+data$classificationGenes <- data$classificationGenes[ Gene %in% colnames(data$x) ]
+```
+
+### Hierarchical clustering
+
+Hierarchical clustering can be used to visually detect any outliers in the data. Using euclidean method to calculate
+the distances between samples.
+
+The dendrogram does not show any clear outliers (they would be seen as separated branches).
+
+```{r}
+distances <- dist(data$x, method = 'euclidean')
+hClusters <- hclust(distances)
+
+colors <- data$key[ , list(
+  Sex = labels2colors(Sex),
+  SurvivalStatus = labels2colors(SurvivalStatus)
+) ]
+
+plotDendroAndColors(hClusters, colors, dendroLabels = FALSE)
+```
+
+### Principal Component Analysis
+
+PCA was used to check if there is any global trends towards the differences between sexes. No such trends are visible
+from the first 3 components. Also, these components do not show any outliers.
+
+```{r}
+pca <- prcomp(data$x, scale = TRUE, center = TRUE)$x[ , 1:3 ]
+
+pcaPlots <- list()
+counter <- 1
+for (i in 1:(ncol(pca) - 1)) {
+  for (j in i:ncol(pca)) {
+    if (i == j) next
+
+    xlabel <- colnames(pca)[ i ]
+    ylabel <- colnames(pca)[ j ]
+
+    pcaPlots[[ counter ]] <- pca[ , c(i, j) ] %>%
+      data.table(keep.rownames = 'SID') %>%
+      setnames(c('SID', 'x', 'y')) %>%
+      merge(data$key[ , list(SID, Sex) ], by = 'SID') %>%
+      ggplot() +
+      geom_point(aes(x = x, y = y, color = Sex), size = 1.5, alpha = 0.75) +
+      ylab(ylabel) +
+      xlab(xlabel) +
+      theme_bw(base_size = 9)
+
+    counter <- counter + 1
+  }
+}
+
+ggarrange(plotlist = pcaPlots,
+          common.legend = TRUE,
+          legend = 'top',
+          ncol = 3)
+
+lapply(data, dim)
+saveRDS(data, 'output/dataNoOutlier.RDS')
+```
+
+```{r, include = FALSE, echo = FALSE}
+rm(cv, cvCutoff, limit, distances, hClusters, colors, pca, pcaPlots, i, j, xlabel, ylabel, counter, data)
+```
+
+## Determine phenotype {.tabset .tabset-pills}
+
+- Perform unsupervised k-means and hierarchical clustering, as well as clustering using scientific methods (using
+  already published algorithm by Mlynska et al.). For all clustering methods, only a subset of genes were used. These
+  are the genes of the scientific clustering algorithm.
+  - **TODO: does it make sense to remove these genes from further analysis?**
+- In order to select samples with the clearest phenotypic features, we chose clusters obtained from k-means and
+  the scientific method as they had the best overlap (N = 354 samples vs N = 339 samples in case of hierarchical
+  and scientific method overlap). Using the overlap of all three methods would have resulted in a too greatly
+  reduced dataset.
+- Final dataset contains 354 samples and 1372 genes.
+
+```{r}
+source('R/determinePhenotype.R')
+
+data <- readRDS('output/dataNoOutlier.RDS')
+
+set.seed(420)
+x <- data$x[ , data$classificationGenes[ , Gene ] ]
+
+kmeansClust <- kmeans(x, 3)$cluster
+hierClust <- x %>%
+  dist(method = 'euclidean') %>%
+  hclust %>%
+  cutree(k = 3)
+scientClust <- determinePhenotype(x, data$classificationGenes)
+
+phenotypes <- scientClust %>%
+  merge(data.table(SID = names(kmeansClust), kMeans = make.names(kmeansClust))) %>%
+  merge(data.table(SID = names(hierClust), Hierarchical = make.names(hierClust)))
+
+phenotypes[ , table(Phenotype, kMeans) ]
+phenotypes[ , table(Hierarchical, kMeans) ]
+phenotypes[ , table(Phenotype, Hierarchical) ]
+```
+
+### Scientific clustering
+
+```{r}
+annoRow <- data$classificationGenes[ , list(Type) ] %>%
+  as.data.frame
+rownames(annoRow) <- data$classificationGenes[ , Gene ]
+
+annoCol <- phenotypes[ , list(Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- phenotypes[ , SID ]
+
+pheatmap(t(x)[ data$classificationGenes[ order(Type), Gene ], phenotypes[ order(Phenotype), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -3.5, to = 3.5, length.out = 101),
+         annotation_col = annoCol,
+         annotation_row = annoRow)
+```
+
+### Hierarchical clustering
+
+```{r}
+annoRow <- data$classificationGenes[ , list(Type) ] %>%
+  as.data.frame
+rownames(annoRow) <- data$classificationGenes[ , Gene ]
+
+annoCol <- phenotypes[ , list(Hierarchical, Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- phenotypes[ , SID ]
+
+pheatmap(t(x)[ data$classificationGenes[ order(Type), Gene ], phenotypes[ order(Hierarchical), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -3.5, to = 3.5, length.out = 101),
+         annotation_col = annoCol,
+         annotation_row = annoRow)
+```
+
+### K-means clustering
+
+```{r}
+annoRow <- data$classificationGenes[ , list(Type) ] %>%
+  as.data.frame
+rownames(annoRow) <- data$classificationGenes[ , Gene ]
+
+annoCol <- phenotypes[ , list(kMeans, Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- phenotypes[ , SID ]
+
+pheatmap(t(x)[ data$classificationGenes[ order(Type), Gene ], phenotypes[ order(kMeans), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -3.5, to = 3.5, length.out = 101),
+         annotation_col = annoCol,
+         annotation_row = annoRow)
+```
+
+### Final clusters
+
+```{r}
+# Set final phenotype based on k-means clustering and the results of the scientific clustering method
+# and select only samples with assigned phenotype for further analysis
+key <- phenotypes %>%
+  .[ kMeans == 'X1' & Phenotype == 'Inf', FinalPheno := 'Inf' ] %>%
+  .[ kMeans == 'X2' & Phenotype == 'Exc', FinalPheno := 'Exc' ] %>%
+  .[ kMeans == 'X3' & Phenotype == 'Des', FinalPheno := 'Des' ] %>%
+  .[ !is.na(FinalPheno) ] %>%
+  .[ , list(SID, Phenotype = FinalPheno) ] %>%
+  .[ , Phenotype := factor(Phenotype, levels = c('Des', 'Exc', 'Inf')) ] %>%
+  merge(data$key, by = 'SID')
+
+x <- data$x[ key[ , SID ], ]
+
+data <- list(
+  x = x,
+  key = key,
+  map = data$map,
+  classificationGenes = data$classificationGenes
+)
+
+lapply(data, dim)
+saveRDS(data, 'output/dataWithPhenotype.RDS')
+```
+
+```{r}
+annoRow <- data$classificationGenes[ , list(Type) ] %>%
+  as.data.frame
+rownames(annoRow) <- data$classificationGenes[ , Gene ]
+
+annoCol <- data$key[ , list(Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- data$key[ , SID ]
+
+pheatmap(t(x)[ data$classificationGenes[ order(Type), Gene ], data$key[ order(Phenotype), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -3.5, to = 3.5, length.out = 101),
+         annotation_col = annoCol,
+         annotation_row = annoRow)
+```
+
+```{r, include = FALSE, echo = FALSE}
+rm(kmeansClust, hierClust, scientClust, scientClust, annoRow, annoCol, x, data, key)
+```
+
+## Survival analysis
+
+```{r}
+data <- readRDS('output/dataWithPhenotype.RDS')
+
+survival <- Surv(time = data$key[ , SurvivalMonths ], event = as.numeric(data$key[ , SurvivalStatus ]))
+fit <- survfit(survival ~ Phenotype, data = data$key)
+# summary(fit)
+
+ggsurvplot(fit, data = data$key, pval = TRUE)
+
+fit.coxph <- coxph(survival ~ Phenotype, data = data$key)
+ggforest(fit.coxph, data = data$key)
+```
+
+```{r, include = FALSE, echo = FALSE}
+rm(survival, fit, fit.coxph)
+```
+
+## Select biomarker genes {.tabset .tabset-pills}
+
+- Fitting linear model to determine which genes are most differentially abundant between different groups.
+- Model adjusted for Phenotype, Age and Sex.
+
+```{r}
+data <- readRDS('output/dataWithPhenotype.RDS')
+
+formula <- '~ 0 + Phenotype + Sex + Age' %>% as.formula
+data$key[ is.na(Age), Age := data$key[ , median(Age, na.rm = TRUE) ] ]
+design <- model.matrix(formula, data$key)
+
+contrasts <- list(
+  Excluded = 'PhenotypeExc - (PhenotypeInf + PhenotypeDes) / 2',
+  Inflamed = 'PhenotypeInf - (PhenotypeExc + PhenotypeDes) / 2',
+  Deserted = 'PhenotypeDes - (PhenotypeInf + PhenotypeExc) / 2'
+)
+
+cm <- makeContrasts(contrasts = contrasts, levels = design)
+colnames(cm) <- names(contrasts)
+
+fit <- lmFit(t(data$x), design, method = 'ls')
+fitc <- contrasts.fit(fit, cm)
+fitc <- eBayes(fitc)
+
+limma <- foreach(contrast = names(contrasts), .combine = rbind) %do% {
+  dt <- topTable(fitc, coef = contrast, number = Inf, sort.by = 'none')
+  if ('ID' %in% colnames(dt)) {
+    return(data.table(dt, Contrast = contrast))
+  } else {
+    return(data.table(ID = rownames(dt), as.data.frame(dt), Contrast = contrast))
+  }
+}
+
+saveRDS(limma, 'output/limma.RDS')
+```
+
+```{r, include = FALSE, echo = FALSE}
+rm(formula, design, contrasts, cm, fit, fitc)
+```
+
+### Excluded
+
+```{r}
+contrast <- 'Excluded'
+```
+
+```{r}
+p1 <- limma[ Contrast == contrast ] %>%
+  ggplot() +
+  geom_histogram(aes(P.Value), binwidth = 0.025, fill = 'white', color = 'black') +
+  theme_bw(base_size = 9)
+
+p2 <- limma[ Contrast == contrast ] %>%
+  .[ , Significant := 'No' ] %>%
+  .[ adj.P.Val < 0.05 & logFC > 1, Significant := 'Yes (up-reg)' ] %>%
+  .[ adj.P.Val < 0.05 & logFC < -1, Significant := 'Yes (down-reg)' ] %>%
+  ggplot() +
+  geom_point(aes(x = logFC, y = -log10(P.Value), color = Significant)) +
+  scale_color_manual(values = c('Yes (up-reg)' = 'salmon', 'Yes (down-reg)' = 'cyan3', 'No' = 'gray80')) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = 'top')
+
+ggarrange(p1, p2, nrow = 1)
+
+ids <- limma[ Contrast == contrast ] %>%
+  .[ order(P.Value) ] %>%
+  .[ 1:6, ID ]
+
+data$x[ , ids ] %>%
+  as.matrix %>%
+  reshape2::melt() %>%
+  setDT %>%
+  setnames(c('SID', 'Gene', 'z-score')) %>%
+  merge(data$key[ , list(SID, Phenotype) ], by = 'SID') %>%
+  ggplot() +
+  facet_wrap(~ Gene, ) +
+  geom_violin(aes(x = Phenotype, y = `z-score`, fill = Phenotype, color = Phenotype), alpha = 0.25) +
+  geom_jitter(aes(x = Phenotype, y = `z-score`, color = Phenotype), height = 0, width = 0.25, size = 0.5, alpha = 0.75)
+```
+
+```{r}
+annoCol <- data$key[ , list(Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- data$key[ , SID ]
+
+pheatmap(t(data$x)[ ids, data$key[ order(Phenotype), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -2.5, to = 2.5, length.out = 101),
+         annotation_col = annoCol)
+```
+
+### Deserted
+
+```{r}
+contrast <- 'Deserted'
+```
+
+```{r}
+p1 <- limma[ Contrast == contrast ] %>%
+  ggplot() +
+  geom_histogram(aes(P.Value), binwidth = 0.025, fill = 'white', color = 'black') +
+  theme_bw(base_size = 9)
+
+p2 <- limma[ Contrast == contrast ] %>%
+  .[ , Significant := 'No' ] %>%
+  .[ adj.P.Val < 0.05 & logFC > 1, Significant := 'Yes (up-reg)' ] %>%
+  .[ adj.P.Val < 0.05 & logFC < -1, Significant := 'Yes (down-reg)' ] %>%
+  ggplot() +
+  geom_point(aes(x = logFC, y = -log10(P.Value), color = Significant)) +
+  scale_color_manual(values = c('Yes (up-reg)' = 'salmon', 'Yes (down-reg)' = 'cyan3', 'No' = 'gray80')) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = 'top')
+
+ggarrange(p1, p2, nrow = 1)
+
+ids <- limma[ Contrast == contrast ] %>%
+  .[ order(P.Value) ] %>%
+  .[ 1:6, ID ]
+
+data$x[ , ids ] %>%
+  as.matrix %>%
+  reshape2::melt() %>%
+  setDT %>%
+  setnames(c('SID', 'Gene', 'z-score')) %>%
+  merge(data$key[ , list(SID, Phenotype) ], by = 'SID') %>%
+  ggplot() +
+  facet_wrap(~ Gene, ) +
+  geom_violin(aes(x = Phenotype, y = `z-score`, fill = Phenotype, color = Phenotype), alpha = 0.25) +
+  geom_jitter(aes(x = Phenotype, y = `z-score`, color = Phenotype), height = 0, width = 0.25, size = 0.5, alpha = 0.75)
+```
+
+```{r}
+annoCol <- data$key[ , list(Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- data$key[ , SID ]
+
+pheatmap(t(data$x)[ ids, data$key[ order(Phenotype), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -2.5, to = 2.5, length.out = 101),
+         annotation_col = annoCol)
+```
+
+### Inflamed
+
+```{r}
+contrast <- 'Inflamed'
+```
+
+```{r}
+p1 <- limma[ Contrast == contrast ] %>%
+  ggplot() +
+  geom_histogram(aes(P.Value), binwidth = 0.025, fill = 'white', color = 'black') +
+  theme_bw(base_size = 9)
+
+p2 <- limma[ Contrast == contrast ] %>%
+  .[ , Significant := 'No' ] %>%
+  .[ adj.P.Val < 0.05 & logFC > 1, Significant := 'Yes (up-reg)' ] %>%
+  .[ adj.P.Val < 0.05 & logFC < -1, Significant := 'Yes (down-reg)' ] %>%
+  ggplot() +
+  geom_point(aes(x = logFC, y = -log10(P.Value), color = Significant)) +
+  scale_color_manual(values = c('Yes (up-reg)' = 'salmon', 'Yes (down-reg)' = 'cyan3', 'No' = 'gray80')) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = 'top')
+
+ggarrange(p1, p2, nrow = 1)
+
+ids <- limma[ Contrast == contrast ] %>%
+  .[ order(P.Value) ] %>%
+  .[ 1:6, ID ]
+
+data$x[ , ids ] %>%
+  as.matrix %>%
+  reshape2::melt() %>%
+  setDT %>%
+  setnames(c('SID', 'Gene', 'z-score')) %>%
+  merge(data$key[ , list(SID, Phenotype) ], by = 'SID') %>%
+  ggplot() +
+  facet_wrap(~ Gene, ) +
+  geom_violin(aes(x = Phenotype, y = `z-score`, fill = Phenotype, color = Phenotype), alpha = 0.25) +
+  geom_jitter(aes(x = Phenotype, y = `z-score`, color = Phenotype), height = 0, width = 0.25, size = 0.5, alpha = 0.75)
+```
+
+```{r}
+annoCol <- data$key[ , list(Phenotype) ] %>%
+  as.data.frame
+rownames(annoCol) <- data$key[ , SID ]
+
+pheatmap(t(data$x)[ ids, data$key[ order(Phenotype), SID ] ],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize = 8,
+         breaks = seq(from = -2.5, to = 2.5, length.out = 101),
+         annotation_col = annoCol)
+```
